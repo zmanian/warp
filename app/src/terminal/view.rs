@@ -431,8 +431,8 @@ use crate::terminal::model::block::{
 };
 use crate::terminal::model::blockgrid::BlockGrid;
 use crate::terminal::model::blocks::{
-    BlockHeight, BlockHeightItem, BlockHeightSummary, BlockList, BlockListPoint, Gap,
-    RemovableBlocklistItem,
+    AgentTranscriptNavigableItem, BlockHeight, BlockHeightItem, BlockHeightSummary, BlockList,
+    BlockListPoint, Gap, RemovableBlocklistItem,
 };
 use crate::terminal::model::escape_sequences::{
     self, C1, EscCodes, ToEscapeSequence, alt_screen_scroll_to_pty_bytes,
@@ -2431,6 +2431,12 @@ pub(in crate::terminal::view) enum PendingUserQueryKind {
     CloudMode,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentTranscriptNavigationDirection {
+    Previous,
+    Next,
+}
+
 #[derive(Debug, Clone)]
 pub struct TerminalDropTargetData {
     pub terminal_view: WeakViewHandle<TerminalView>,
@@ -2503,6 +2509,9 @@ pub struct TerminalView {
     hovered_block_index: Option<BlockIndex>,
 
     selected_blocks: SelectedBlocks,
+
+    /// Focused navigable transcript item in the active agent view (prompt or user shell block).
+    agent_transcript_selection: Option<AgentTranscriptNavigableItem>,
 
     // Whether any session contains blocks from a remote session. Cached to improve performance.
     // Blocks don't necessarily need to be finished for this to be true (e.g. it's true for
@@ -4275,6 +4284,7 @@ impl TerminalView {
             open_secret_tool_tip: None,
             hovered_block_index: None,
             selected_blocks: Default::default(),
+            agent_transcript_selection: None,
             block_list_mouse_states,
             any_session_contains_remote_blocks: false,
             any_session_contains_restored_remote_blocks: false,
@@ -19724,6 +19734,11 @@ impl TerminalView {
             self.close_context_menu(ctx, true);
         }
 
+        if !is_shift_down && self.should_use_agent_transcript_navigation(ctx) {
+            self.navigate_agent_transcript(AgentTranscriptNavigationDirection::Previous, ctx);
+            return;
+        }
+
         if let Some(selected_block_index) = self.selected_blocks.tail() {
             let new_block_index = self
                 .model
@@ -19778,6 +19793,12 @@ impl TerminalView {
         if self.is_context_menu_open() {
             self.close_context_menu(ctx, true);
         }
+
+        if !is_shift_down && self.should_use_agent_transcript_navigation(ctx) {
+            self.navigate_agent_transcript(AgentTranscriptNavigationDirection::Next, ctx);
+            return;
+        }
+
         let input_mode = *InputModeSettings::as_ref(ctx).input_mode.value();
         let is_inverted_blocklist = input_mode.is_inverted_blocklist();
         let is_most_recent_block_visible = {
@@ -19901,6 +19922,8 @@ impl TerminalView {
         block_index: BlockIndex,
         ctx: &mut ViewContext<Self>,
     ) {
+        self.agent_transcript_selection =
+            Some(AgentTranscriptNavigableItem::ShellBlock(block_index));
         self.change_block_selections(
             |selected_blocks| {
                 selected_blocks.reset_to_single(block_index);
@@ -19911,6 +19934,7 @@ impl TerminalView {
     }
 
     fn clear_selected_blocks(&mut self, ctx: &mut ViewContext<Self>) {
+        self.agent_transcript_selection = None;
         self.change_block_selections(
             |selected_blocks| {
                 selected_blocks.reset();
@@ -19918,6 +19942,128 @@ impl TerminalView {
             ctx,
         );
         ctx.notify();
+    }
+
+    fn should_use_agent_transcript_navigation(&self, ctx: &AppContext) -> bool {
+        FeatureFlag::AgentView.is_enabled() && self.agent_view_controller.as_ref(ctx).is_active()
+    }
+
+    fn navigate_agent_transcript(
+        &mut self,
+        direction: AgentTranscriptNavigationDirection,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let navigable_items = {
+            let model = self.model.lock();
+            model.block_list().agent_transcript_navigable_items()
+        };
+        if navigable_items.is_empty() {
+            return;
+        }
+
+        let current = self.agent_transcript_selection.or_else(|| {
+            self.selected_blocks
+                .tail()
+                .map(AgentTranscriptNavigableItem::ShellBlock)
+        });
+
+        let target = match direction {
+            AgentTranscriptNavigationDirection::Previous => match current {
+                Some(current) => match navigable_items.iter().position(|item| *item == current) {
+                    // Stay on the oldest item, matching ordinary block navigation.
+                    Some(0) => Some(current),
+                    Some(index) => Some(navigable_items[index - 1]),
+                    // Absent/stale cursor: start from the newest navigable item.
+                    None => navigable_items.last().copied(),
+                },
+                None => navigable_items.last().copied(),
+            },
+            AgentTranscriptNavigationDirection::Next => match current {
+                Some(current) => {
+                    let next = navigable_items
+                        .iter()
+                        .position(|item| *item == current)
+                        .and_then(|index| navigable_items.get(index + 1).copied());
+                    if next.is_none() {
+                        self.clear_selected_blocks(ctx);
+                        ctx.focus(&self.input);
+                        ctx.notify();
+                        return;
+                    }
+                    next
+                }
+                None => navigable_items.last().copied(),
+            },
+        };
+
+        let Some(target) = target else {
+            return;
+        };
+        self.apply_agent_transcript_selection(target, direction, ctx);
+    }
+
+    fn apply_agent_transcript_selection(
+        &mut self,
+        target: AgentTranscriptNavigableItem,
+        direction: AgentTranscriptNavigationDirection,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.agent_transcript_selection = Some(target);
+        match target {
+            AgentTranscriptNavigableItem::ShellBlock(block_index) => {
+                self.reset_selection_to_single_block(block_index, ctx);
+                self.scroll_to_if_not_visible(block_index, ctx);
+            }
+            AgentTranscriptNavigableItem::AiBlock { view_id } => {
+                self.change_block_selections(
+                    |selected_blocks| {
+                        selected_blocks.reset();
+                    },
+                    ctx,
+                );
+                self.scroll_to_rich_content_view(view_id, ctx);
+            }
+        }
+
+        let (delta, is_cmd_down) = match direction {
+            AgentTranscriptNavigationDirection::Previous => (BlockSelectionDelta::Previous, false),
+            AgentTranscriptNavigationDirection::Next => (BlockSelectionDelta::Next, true),
+        };
+        send_telemetry_from_ctx!(
+            TelemetryEvent::BlockSelection(BlockSelectionDetails {
+                cardinality: self.selected_blocks.cardinality(),
+                delta,
+                is_cmd_down,
+                is_shift_down: false,
+            }),
+            ctx
+        );
+
+        self.tips_completed.update(ctx, |tips, ctx| {
+            mark_feature_used_and_write_to_user_defaults(
+                Tip::Hint(TipHint::BlockSelect),
+                tips,
+                ctx,
+            );
+            ctx.notify();
+        });
+        ctx.notify();
+    }
+
+    fn scroll_to_rich_content_view(&mut self, view_id: EntityId, ctx: &mut ViewContext<Self>) {
+        let Some(index) = self
+            .model
+            .lock()
+            .block_list()
+            .removable_blocklist_item_position(&RemovableBlocklistItem::RichContent(view_id))
+            .copied()
+        else {
+            return;
+        };
+        self.update_scroll_position_locking(
+            ScrollPositionUpdate::ScrollToTopOfRichContent { index },
+            ctx,
+        );
     }
 
     /// Clears selected text across all types of blocks and handles side effects (i.e. Agent Mode
@@ -22663,6 +22809,11 @@ impl TerminalView {
     #[cfg(any(test, feature = "integration_tests"))]
     pub fn selected_blocks_tail_index(&self) -> Option<BlockIndex> {
         self.selected_blocks.tail()
+    }
+
+    #[cfg(any(test, feature = "integration_tests"))]
+    pub fn agent_transcript_selection_for_test(&self) -> Option<AgentTranscriptNavigableItem> {
+        self.agent_transcript_selection
     }
 
     #[cfg(any(test, feature = "integration_tests"))]

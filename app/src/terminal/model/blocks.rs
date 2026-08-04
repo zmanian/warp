@@ -46,7 +46,9 @@ use crate::terminal::model::ansi::{
     CursorShape, CursorStyle, LineClearMode, Mode, PrecmdValue, PreexecValue, Processor,
     PromptMetadata, StandardCharset, TabulationClearMode,
 };
-use crate::terminal::model::block::{AgentViewVisibility, Block, SerializedBlock, TranscriptScope};
+use crate::terminal::model::block::{
+    AgentViewVisibility, Block, InteractionMode, SerializedBlock, TranscriptScope,
+};
 use crate::terminal::model::blockgrid::BlockGrid;
 use crate::terminal::model::bootstrap::BootstrapStage;
 use crate::terminal::model::grid::Dimensions;
@@ -227,6 +229,18 @@ pub struct BlockScrollPosition {
 pub enum RemovableBlocklistItem {
     InlineBanner(InlineBannerId),
     RichContent(EntityId),
+}
+
+/// A chronologically ordered, keyboard-navigable item in an agent-view transcript.
+///
+/// Used by Cmd-Up / Cmd-Down to move across user prompts (AI blocks) and eligible
+/// user-executed shell blocks while skipping agent tool-call/result command blocks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum AgentTranscriptNavigableItem {
+    /// A mounted AI rich-content block (user query / agent exchange prompt).
+    AiBlock { view_id: EntityId },
+    /// A visible user-executed shell command block.
+    ShellBlock(BlockIndex),
 }
 
 pub struct BlockList {
@@ -2124,6 +2138,56 @@ impl BlockList {
         }
 
         None
+    }
+
+    /// Chronological navigable targets for Cmd-Up/Cmd-Down in the active agent view.
+    ///
+    /// Includes mounted AI blocks (user prompts) and eligible user-executed shell
+    /// command blocks. Skips agent-requested tool-call command blocks, hidden
+    /// items, gaps, banners, and other non-navigable rich content.
+    pub fn agent_transcript_navigable_items(&self) -> Vec<AgentTranscriptNavigableItem> {
+        let mut items = Vec::new();
+        // Match production block_heights traversal: seek left to the first item, then
+        // read `item`/`start` before advancing with `next`. Do not call `next` before the
+        // loop (that invalidates `start` and panics with "Must seek before calling...").
+        let mut cursor = self
+            .block_heights
+            .cursor::<TotalIndex, BlockHeightSummary>();
+        cursor.seek(&TotalIndex(0), SeekBias::Left);
+        while let Some(item) = cursor.item() {
+            match item {
+                BlockHeightItem::RichContent(rich_content)
+                    if !rich_content.should_hide
+                        && rich_content.last_laid_out_height > BlockHeight::zero()
+                        && rich_content
+                            .content_type
+                            .is_some_and(|content_type| content_type.is_ai_block()) =>
+                {
+                    items.push(AgentTranscriptNavigableItem::AiBlock {
+                        view_id: rich_content.view_id,
+                    });
+                }
+                BlockHeightItem::Block(_) => {
+                    // `start().block_count` is the index of the current block item.
+                    let block_index = BlockIndex::from(cursor.start().block_count);
+                    if let Some(block) = self.block_at(block_index)
+                        && BlockFilter::commands().matches(block, &self.transcript_scope)
+                        // Agent run-shell / monitored commands use InteractionMode::Agent even
+                        // after unhide or without a requested_command_action_id.
+                        && matches!(block.interaction_mode(), InteractionMode::User(_))
+                    {
+                        items.push(AgentTranscriptNavigableItem::ShellBlock(block_index));
+                    }
+                }
+                BlockHeightItem::RichContent(_)
+                | BlockHeightItem::Gap(_)
+                | BlockHeightItem::RestoredBlockSeparator { .. }
+                | BlockHeightItem::InlineBanner { .. }
+                | BlockHeightItem::SubshellSeparator { .. } => {}
+            }
+            cursor.next();
+        }
+        items
     }
 
     /// Return the height of the last non hidden rich content block after a block index. If there is no non hidden rich content block, return None.

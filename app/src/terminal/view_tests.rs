@@ -193,6 +193,216 @@ fn agent_view_lifecycle_updates_input_mode() {
 }
 
 #[test]
+fn cmd_up_in_agent_view_navigates_prompts_and_user_shell_blocks() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        let (prompt_view_ids, user_shell_index) = terminal.update(&mut app, |view, ctx| {
+            let conversation_id = view.agent_view_controller().update(ctx, |controller, ctx| {
+                controller
+                    .try_enter_agent_view(
+                        None,
+                        AgentViewEntryOrigin::Input {
+                            was_prompt_autodetected: false,
+                        },
+                        ctx,
+                    )
+                    .expect("agent view entry should succeed")
+            });
+
+            fn append_query_to_conversation(
+                view: &mut TerminalView,
+                conversation_id: AIConversationId,
+                query: &str,
+                ctx: &mut ViewContext<TerminalView>,
+            ) {
+                let history_model = BlocklistAIHistoryModel::handle(ctx);
+                let (exchange_id, task_id, response_stream_id) =
+                    history_model.update(ctx, |history_model, ctx| {
+                        let response_stream_id = ResponseStreamId::new_for_test();
+                        let exchange = exchange_with_inputs(vec![AIAgentInput::UserQuery {
+                            query: query.to_owned(),
+                            context: Default::default(),
+                            static_query_type: None,
+                            referenced_attachments: Default::default(),
+                            user_query_mode: UserQueryMode::Normal,
+                            running_command: None,
+                            intended_agent: None,
+                        }]);
+                        let exchange_id = exchange.id;
+                        let task_id = history_model
+                            .conversation(&conversation_id)
+                            .expect("conversation should exist")
+                            .get_root_task_id()
+                            .clone();
+                        history_model
+                            .conversation_mut(&conversation_id)
+                            .expect("conversation should exist")
+                            .append_reassigned_exchange(
+                                &response_stream_id,
+                                exchange,
+                                view.view_id,
+                                ctx,
+                            )
+                            .expect("exchange should append");
+                        (exchange_id, task_id, response_stream_id)
+                    });
+                view.handle_ai_history_model_event(
+                    history_model,
+                    &BlocklistAIHistoryEvent::AppendedExchange {
+                        exchange_id,
+                        task_id,
+                        terminal_surface_id: view.view_id,
+                        conversation_id,
+                        is_hidden: false,
+                        response_stream_id: Some(response_stream_id),
+                    },
+                    ctx,
+                );
+            }
+
+            // prompt 1
+            append_query_to_conversation(view, conversation_id, "prompt 1", ctx);
+
+            // Agent-requested run-shell (unhidden) and agent-monitored command: not navigable.
+            {
+                let mut model = view.model.lock();
+                model.simulate_block("tool-call", "tool-result");
+                let tool_index = model.block_list().blocks().len() - 2;
+                let action_id = AIAgentActionId::from("tool-action".to_owned());
+                {
+                    let block = &mut model.block_list_mut().blocks_mut()[tool_index];
+                    block.set_conversation_id(conversation_id);
+                    block.set_agent_interaction_mode(
+                        crate::terminal::model::block::AgentInteractionMetadata::new_hidden(
+                            action_id.clone(),
+                            conversation_id,
+                        ),
+                    );
+                }
+                model
+                    .block_list_mut()
+                    .set_visibility_of_block_for_ai_action(&action_id, true);
+
+                model.simulate_block("agent-monitored", "output");
+                let monitored_index = model.block_list().blocks().len() - 2;
+                let block = &mut model.block_list_mut().blocks_mut()[monitored_index];
+                block.set_conversation_id(conversation_id);
+                block.set_agent_interaction_mode(
+                    crate::terminal::model::block::AgentInteractionMetadata::new(
+                        None,
+                        conversation_id,
+                        None,
+                        None,
+                        false,
+                        false,
+                    ),
+                );
+            }
+
+            // user-executed shell command (navigable)
+            let user_shell_index = {
+                let mut model = view.model.lock();
+                model.simulate_block("user-shell", "shell-output");
+                let index = model.block_list().blocks().len() - 2;
+                model.block_list_mut().blocks_mut()[index].set_conversation_id(conversation_id);
+                index.into()
+            };
+
+            // prompt 2
+            append_query_to_conversation(view, conversation_id, "prompt 2", ctx);
+
+            let prompt_view_ids: Vec<_> = view
+                .rich_content_views
+                .iter()
+                .filter_map(|rc| rc.ai_block_metadata().map(|meta| meta.ai_block_handle.id()))
+                .collect();
+            assert!(
+                prompt_view_ids.len() >= 2,
+                "expected at least two AI prompt blocks, got {}",
+                prompt_view_ids.len()
+            );
+            (prompt_view_ids, user_shell_index)
+        });
+
+        let prompt_1 = *prompt_view_ids.first().expect("prompt 1");
+        let prompt_2 = *prompt_view_ids.last().expect("prompt 2");
+
+        terminal.update(&mut app, |view, ctx| {
+            // From the bottom: first Cmd-Up lands on latest prompt.
+            view.select_less_recent_block(false /* is_shift_down */, ctx);
+            assert_eq!(
+                view.agent_transcript_selection_for_test(),
+                Some(
+                    crate::terminal::model::blocks::AgentTranscriptNavigableItem::AiBlock {
+                        view_id: prompt_2
+                    }
+                )
+            );
+            assert_eq!(view.selected_blocks.tail(), None);
+
+            // Next Cmd-Up lands on the user shell command.
+            view.select_less_recent_block(false, ctx);
+            assert_eq!(
+                view.agent_transcript_selection_for_test(),
+                Some(
+                    crate::terminal::model::blocks::AgentTranscriptNavigableItem::ShellBlock(
+                        user_shell_index
+                    )
+                )
+            );
+            assert_eq!(view.selected_blocks.tail(), Some(user_shell_index));
+
+            // Next Cmd-Up lands on the first prompt, skipping the tool call.
+            view.select_less_recent_block(false, ctx);
+            assert_eq!(
+                view.agent_transcript_selection_for_test(),
+                Some(
+                    crate::terminal::model::blocks::AgentTranscriptNavigableItem::AiBlock {
+                        view_id: prompt_1
+                    }
+                )
+            );
+            assert_eq!(view.selected_blocks.tail(), None);
+
+            // Another Cmd-Up at the oldest item stays put.
+            view.select_less_recent_block(false, ctx);
+            assert_eq!(
+                view.agent_transcript_selection_for_test(),
+                Some(
+                    crate::terminal::model::blocks::AgentTranscriptNavigableItem::AiBlock {
+                        view_id: prompt_1
+                    }
+                )
+            );
+            assert_eq!(view.selected_blocks.tail(), None);
+
+            // Cmd-Down symmetry walks back toward the latest prompt.
+            view.select_more_recent_block(true, false, ctx);
+            assert_eq!(
+                view.agent_transcript_selection_for_test(),
+                Some(
+                    crate::terminal::model::blocks::AgentTranscriptNavigableItem::ShellBlock(
+                        user_shell_index
+                    )
+                )
+            );
+            view.select_more_recent_block(true, false, ctx);
+            assert_eq!(
+                view.agent_transcript_selection_for_test(),
+                Some(
+                    crate::terminal::model::blocks::AgentTranscriptNavigableItem::AiBlock {
+                        view_id: prompt_2
+                    }
+                )
+            );
+        });
+    })
+}
+
+#[test]
 fn focus_reporting_writes_focus_events_in_normal_screen() {
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
