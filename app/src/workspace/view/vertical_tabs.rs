@@ -1,7 +1,7 @@
 pub mod telemetry;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -55,7 +55,7 @@ use crate::pane_group::{
     CodePane, NotebookPane, PaneGroup, PaneId, TabBarHoverIndex, TerminalPane, WorkflowPane,
 };
 use crate::safe_triangle::SafeTriangle;
-use crate::tab::{SelectedTabColor, TabData, tab_position_id};
+use crate::tab::{SelectedTabColor, TAB_INDICATOR_SYNCED_COLOR, TabData, tab_position_id};
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::session_settings::SessionSettings;
 use crate::terminal::view::TerminalViewState;
@@ -70,6 +70,7 @@ use crate::util::color::Opacity;
 use crate::workspace::action::{NewSessionMenuAnchor, WorkspaceAction};
 use crate::workspace::cross_window_tab_drag::CrossWindowTabDrag;
 use crate::workspace::hoa_onboarding::HoaOnboardingStep;
+use crate::workspace::sync_inputs::SyncedInputState;
 use crate::workspace::tab_group::{TabGroup, TabGroupId};
 use crate::workspace::tab_settings::{
     TabSettings, VerticalTabsCompactSubtitle, VerticalTabsDisplayGranularity,
@@ -1781,7 +1782,7 @@ fn render_groups(
             .collect()
     } else {
         let query_lower = query.to_lowercase();
-        workspace
+        let own_matches: Vec<(usize, Option<Vec<PaneId>>)> = workspace
             .tabs
             .iter()
             .enumerate()
@@ -1882,7 +1883,24 @@ fn render_groups(
                     }
                 }
             })
-            .collect()
+            .collect();
+
+        // A query matching a group's name reveals every tab under that group,
+        // even members whose own text does not match.
+        let matched_groups: HashSet<TabGroupId> = workspace
+            .tab_groups
+            .iter()
+            .filter(|(_, group)| {
+                group_display_name(group)
+                    .to_lowercase()
+                    .contains(&query_lower)
+            })
+            .map(|(group_id, _)| *group_id)
+            .collect();
+        let tab_group_ids: Vec<Option<TabGroupId>> =
+            workspace.tabs.iter().map(|tab| tab.group_id).collect();
+
+        merge_group_name_matches(&tab_group_ids, &matched_groups, own_matches)
     };
 
     if visible_tabs.is_empty() {
@@ -1930,7 +1948,14 @@ fn render_groups(
                 .get(&gid)
                 .map(|group| (gid, group.clone()))
         }) {
-            Some((group_id, group)) => {
+            Some((group_id, mut group)) => {
+                // While a search is active, render every surviving group
+                // expanded so its matches are visible without a click. This
+                // only mutates the local clone — the stored `collapsed` flag is
+                // untouched, so clearing the query restores the real state.
+                if !query.is_empty() {
+                    group.collapsed = false;
+                }
                 // Members are a contiguous subslice of `visible_tabs`.
                 let run_len = visible_tabs[i..]
                     .iter()
@@ -2788,10 +2813,7 @@ fn render_grouped_tabs_header(
         if let Some(editor) = rename_editor.filter(|_| is_being_renamed) {
             render_inline_tab_rename_editor(editor, appearance, app)
         } else {
-            let title_text = group
-                .name
-                .clone()
-                .unwrap_or_else(|| "New Group".to_string());
+            let title_text = group_display_name(group);
             Text::new_inline(title_text, font_family, 12.)
                 .with_clip(ClipConfig::ellipsis())
                 .with_color(main_text_color.into())
@@ -3392,6 +3414,77 @@ fn render_title_indicator(theme: &WarpTheme) -> Box<dyn Element> {
     .finish()
 }
 
+/// Whether a row should surface the synchronized-inputs indicator. Mirrors the
+/// horizontal tab bar's `Indicator::Synced` gating in `tab.rs`: the row's tab is
+/// receiving broadcast keystrokes and tab indicators are enabled. Restricted to
+/// terminal rows because syncing only broadcasts to terminal panes.
+fn shows_synced_inputs_indicator(
+    is_terminal_row: bool,
+    are_inputs_synced: bool,
+    show_tab_indicators: bool,
+) -> bool {
+    is_terminal_row && are_inputs_synced && show_tab_indicators
+}
+
+fn row_shows_synced_inputs_indicator(props: &PaneProps<'_>, app: &AppContext) -> bool {
+    shows_synced_inputs_indicator(
+        matches!(props.typed, TypedPane::Terminal(_)),
+        SyncedInputState::as_ref(app)
+            .should_sync_this_pane_group(props.pane_group_id, props.window_id()),
+        *TabSettings::as_ref(app).show_indicators.value(),
+    )
+}
+
+/// Link icon marking a row whose tab has synchronized inputs enabled. Uses the
+/// same icon and color as the horizontal tab bar's `Indicator::Synced`.
+fn render_synced_inputs_indicator() -> Box<dyn Element> {
+    ConstrainedBox::new(
+        UiIcon::LinkHorizontal
+            .to_warpui_icon(ColorU::from_u32(TAB_INDICATOR_SYNCED_COLOR).into())
+            .finish(),
+    )
+    .with_width(BADGE_ICON_SIZE)
+    .with_height(BADGE_ICON_SIZE)
+    .finish()
+}
+
+/// Row title line with its trailing indicators — the synchronized-inputs link
+/// icon followed by the unread-activity dot — pinned to the right edge. Returns
+/// `title` untouched when the row has no indicator to show.
+fn render_row_title_line(
+    title: Box<dyn Element>,
+    shows_synced_inputs: bool,
+    shows_activity_indicator: bool,
+    theme: &WarpTheme,
+) -> Box<dyn Element> {
+    if !shows_synced_inputs && !shows_activity_indicator {
+        return title;
+    }
+
+    let mut indicators = Flex::row()
+        .with_main_axis_size(MainAxisSize::Min)
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .with_spacing(4.);
+    if shows_synced_inputs {
+        indicators.add_child(render_synced_inputs_indicator());
+    }
+    if shows_activity_indicator {
+        indicators.add_child(render_title_indicator(theme));
+    }
+
+    Flex::row()
+        .with_main_axis_size(MainAxisSize::Max)
+        .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .with_child(Shrinkable::new(1., title).finish())
+        .with_child(
+            Container::new(indicators.finish())
+                .with_margin_left(4.)
+                .finish(),
+        )
+        .finish()
+}
+
 fn render_pane_row(props: PaneProps<'_>, app: &AppContext) -> Box<dyn Element> {
     let effective_subtitle = props.subtitle.clone();
     let appearance = Appearance::as_ref(app);
@@ -3852,6 +3945,12 @@ impl<'a> PaneProps<'a> {
         })
     }
 
+    /// Window this row is rendered in. Sourced from the detail hover state,
+    /// which is always built for the window owning the vertical tabs panel.
+    fn window_id(&self) -> WindowId {
+        self.detail_hover_state.window_id
+    }
+
     fn displayed_title(&self) -> &str {
         self.custom_vertical_tabs_title
             .as_deref()
@@ -3929,6 +4028,59 @@ fn should_show_tab_group_header(
     visible_pane_count: usize,
 ) -> bool {
     has_custom_title || is_being_renamed || visible_pane_count > 1
+}
+
+/// Header text for a tab group the user has never named.
+const UNTITLED_GROUP_NAME: &str = "New Group";
+
+/// The group title as displayed in the panel header, including the fallback
+/// used for a group the user has never named. Search matches against this so a
+/// query matches what is actually on screen.
+fn group_display_name(group: &TabGroup) -> String {
+    group
+        .name
+        .clone()
+        .unwrap_or_else(|| UNTITLED_GROUP_NAME.to_string())
+}
+
+/// Force-includes every member of a name-matched tab group into the search
+/// results, so matching a group by name reveals all the tabs under it.
+///
+/// `own_matches` holds the tabs that matched the query on their own text, as
+/// `(tab index, matching pane ids)` where `None` means "render all pane rows".
+/// Output stays ordered by tab index: `render_groups` collapses a group's
+/// members into one container by scanning a contiguous run, so an out-of-order
+/// entry would split the group across several rendered containers.
+///
+/// A member already present from its own text match is upgraded to `None`
+/// rather than duplicated — a group-name match shows whole tabs, not
+/// pane-filtered slices of them.
+fn merge_group_name_matches(
+    tab_group_ids: &[Option<TabGroupId>],
+    matched_groups: &HashSet<TabGroupId>,
+    own_matches: Vec<(usize, Option<Vec<PaneId>>)>,
+) -> Vec<(usize, Option<Vec<PaneId>>)> {
+    if matched_groups.is_empty() {
+        return own_matches;
+    }
+
+    let mut merged: Vec<(usize, Option<Vec<PaneId>>)> = Vec::with_capacity(own_matches.len());
+    let mut own_matches = own_matches.into_iter().peekable();
+
+    for (tab_index, group_id) in tab_group_ids.iter().enumerate() {
+        let in_matched_group = group_id.is_some_and(|id| matched_groups.contains(&id));
+        let own_match = own_matches.next_if(|(index, _)| *index == tab_index);
+
+        match (in_matched_group, own_match) {
+            // The group name matched, so the whole tab is shown regardless of
+            // whether it also matched on its own text.
+            (true, _) => merged.push((tab_index, None)),
+            (false, Some(own_match)) => merged.push(own_match),
+            (false, None) => {}
+        }
+    }
+
+    merged
 }
 
 fn search_fragments_contain_query(fragments: &[String], query_lower: &str) -> bool {
@@ -4402,21 +4554,12 @@ fn render_terminal_row_content(
         }
     };
 
-    let first_line_element = if has_unread_activity(&props.typed, app) {
-        Flex::row()
-            .with_main_axis_size(MainAxisSize::Max)
-            .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
-            .with_child(Shrinkable::new(1., first_line).finish())
-            .with_child(
-                Container::new(render_title_indicator(theme))
-                    .with_margin_left(4.)
-                    .finish(),
-            )
-            .finish()
-    } else {
-        first_line
-    };
+    let first_line_element = render_row_title_line(
+        first_line,
+        row_shows_synced_inputs_indicator(props, app),
+        has_unread_activity(&props.typed, app),
+        theme,
+    );
 
     let mut content = Flex::column()
         .with_main_axis_size(MainAxisSize::Min)
@@ -4701,24 +4844,12 @@ fn render_summary_tab_item(
             }
         }
     }
-    let title_region = title_region.finish();
-    if summary.has_unread_activity {
-        text_col.add_child(
-            Flex::row()
-                .with_main_axis_size(MainAxisSize::Max)
-                .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_child(Shrinkable::new(1., title_region).finish())
-                .with_child(
-                    Container::new(render_title_indicator(theme))
-                        .with_margin_left(4.)
-                        .finish(),
-                )
-                .finish(),
-        );
-    } else {
-        text_col.add_child(title_region);
-    }
+    text_col.add_child(render_row_title_line(
+        title_region.finish(),
+        row_shows_synced_inputs_indicator(&props, app),
+        summary.has_unread_activity,
+        theme,
+    ));
 
     // Working-directory region.
     let visible_directory_count = summary
@@ -7298,22 +7429,13 @@ fn render_compact_pane_row(props: PaneProps<'_>, app: &AppContext) -> Box<dyn El
             (title, subtitle)
         };
 
-    // Title row with optional indicator
-    let title_row = if has_indicator {
-        Flex::row()
-            .with_main_axis_size(MainAxisSize::Max)
-            .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
-            .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_child(Shrinkable::new(1., title_element).finish())
-            .with_child(
-                Container::new(render_title_indicator(theme))
-                    .with_margin_left(4.)
-                    .finish(),
-            )
-            .finish()
-    } else {
-        title_element
-    };
+    // Title row with optional indicators
+    let title_row = render_row_title_line(
+        title_element,
+        row_shows_synced_inputs_indicator(&props, app),
+        has_indicator,
+        theme,
+    );
 
     // Assemble text column: title + optional subtitle
     // Top-align the icon when there are two lines of content; center for single-line rows.
