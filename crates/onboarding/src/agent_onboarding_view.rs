@@ -356,6 +356,17 @@ impl AgentOnboardingView {
         ctx.notify();
     }
 
+    pub fn set_pricing_promotion_message(
+        &mut self,
+        message: Option<String>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.onboarding_state.update(ctx, |state, ctx| {
+            state.set_pricing_promotion_message(message, ctx);
+        });
+        ctx.notify();
+    }
+
     pub fn set_workspace_enforces_autonomy(&mut self, value: bool, ctx: &mut ViewContext<Self>) {
         self.onboarding_state.update(ctx, |state, ctx| {
             state.set_workspace_enforces_autonomy(value, ctx);
@@ -406,6 +417,17 @@ impl AgentOnboardingView {
             state.on_credit_availability_observed(available, ctx);
         });
         ctx.notify();
+    }
+
+    /// A web checkout reported success through the desktop hand-off. Returns
+    /// whether an AI-sell onboarding screen consumed it, so the caller can tell
+    /// a post-checkout return apart from an unrelated deeplink.
+    pub fn on_checkout_succeeded(&mut self, ctx: &mut ViewContext<Self>) -> bool {
+        let advanced = self
+            .onboarding_state
+            .update(ctx, |state, ctx| state.on_checkout_succeeded(ctx));
+        ctx.notify();
+        advanced
     }
 
     /// The purchased credits are on the account. Safe to call speculatively
