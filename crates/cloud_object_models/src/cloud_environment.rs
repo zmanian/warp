@@ -16,13 +16,26 @@ pub enum CodeForge {
     GitHub,
     #[serde(rename = "GITLAB")]
     GitLab,
+    /// Explicit "no code forge" container value: a repo-less environment
+    /// that clones nothing and relies entirely on `setup_commands`.
+    #[serde(rename = "NONE")]
+    None,
+    // Catches a forge value this client build doesn't recognize yet (e.g. the
+    // server adds one before this client updates), so the rest of the
+    // environment still deserializes instead of the whole object failing.
+    #[serde(other)]
+    Unknown,
 }
 
 impl CodeForge {
+    /// The clonable host for this forge, empty for `None`/`Unknown` since
+    /// neither identifies one; callers must not fall back to `github.com`
+    /// for either, which would authenticate against the wrong host.
     pub const fn host(self) -> &'static str {
         match self {
             CodeForge::GitHub => "github.com",
             CodeForge::GitLab => "gitlab.com",
+            CodeForge::None | CodeForge::Unknown => "",
         }
     }
 }
@@ -32,6 +45,8 @@ impl fmt::Display for CodeForge {
         match self {
             CodeForge::GitHub => write!(f, "GitHub"),
             CodeForge::GitLab => write!(f, "GitLab"),
+            CodeForge::None => write!(f, "None"),
+            CodeForge::Unknown => write!(f, "Unknown"),
         }
     }
 }
@@ -212,6 +227,9 @@ pub struct AmbientAgentEnvironment {
     ///   - `Some([...])`: these specific secrets are the default
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secrets: Option<Vec<EnvironmentSecretRef>>,
+    /// Runner supplying compute for runs that do not name one themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_runner_uid: Option<String>,
 }
 
 impl AmbientAgentEnvironment {
@@ -232,6 +250,7 @@ impl AmbientAgentEnvironment {
             setup_commands,
             providers: ProvidersConfig::default(),
             secrets: None,
+            default_runner_uid: None,
         }
     }
 
